@@ -117,10 +117,32 @@ module "lambda_function_iam_role" {
     EOF
 }
 
+module "lambda_function_code_bucket" {
+  source      = "./modules/s3"
+  bucket_name = "process-embeddin-function-src"
+  objects = [
+    {
+      key    = "process_embedding.zip"
+      source = "./files/process_embedding.zip"
+    }
+  ]
+  bucket_policy = ""
+  cors = [
+    {
+      allowed_headers = ["*"]
+      allowed_methods = ["GET"]
+      allowed_origins = ["*"]
+      max_age_seconds = 3000
+    }
+  ]
+  versioning_enabled = "Enabled"
+  force_destroy      = false
+}
+
 # Lambda function to upload document embeddings into vector database
 module "lambda_function" {
   source        = "./modules/lambda"
-  function_name = "lambda-function"
+  function_name = "process-embeddings-function"
   role_arn      = module.lambda_function_iam_role.arn
   env_variables = {
     REGION              = var.region
@@ -128,11 +150,11 @@ module "lambda_function" {
     PINECONE_ENV        = ""
     PINECONE_INDEX_NAME = ""
   }
-  handler    = "lambda_function.lambda_handler"
+  handler    = "main.lambda_handler"
   runtime    = "python3.12"
   s3_bucket  = module.lambda_function_code_bucket.bucket
-  s3_key     = "lambda_function.zip"
-  depends_on = [module.mediaconvert_function_code_bucket]
+  s3_key     = "process_embedding.zip"
+  depends_on = [module.lambda_function_code_bucket]
 }
 
 # Cognito
@@ -172,9 +194,9 @@ module "cognito" {
 }
 
 # VPC Configuration
-module "vpc" {
+module "docrag_vpc" {
   source                = "./modules/vpc/vpc"
-  vpc_name              = "vpc"
+  vpc_name              = "docrag-vpc"
   vpc_cidr_block        = "10.0.0.0/16"
   enable_dns_hostnames  = true
   enable_dns_support    = true
@@ -182,10 +204,10 @@ module "vpc" {
 }
 
 # Security Group
-module "security_group" {
+module "docrag_frontend_lb_sg" {
   source = "./modules/vpc/security_groups"
-  vpc_id = module.vpc.vpc_id
-  name   = "security-group"
+  vpc_id = module.docrag_vpc.vpc_id
+  name   = "docrag_frontend_lb_sg"
   ingress = [
     {
       from_port       = 80
@@ -194,11 +216,36 @@ module "security_group" {
       self            = "false"
       cidr_blocks     = ["0.0.0.0/0"]
       security_groups = []
-      description     = "any"
+      description     = "HTTP traffic"
     },
     {
-      from_port       = 22
-      to_port         = 22
+      from_port       = 443
+      to_port         = 443
+      protocol        = "tcp"
+      self            = "false"
+      cidr_blocks     = ["0.0.0.0/0"]
+      security_groups = []
+      description     = "HTTPS traffic"
+    }
+  ]
+  egress = [
+    {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
+}
+
+module "docrag_backend_lb_sg" {
+  source = "./modules/vpc/security_groups"
+  vpc_id = module.docrag_vpc.vpc_id
+  name   = "docrag_backend_lb_sg"
+  ingress = [
+    {
+      from_port       = 80
+      to_port         = 80
       protocol        = "tcp"
       self            = "false"
       cidr_blocks     = ["0.0.0.0/0"]
@@ -216,10 +263,60 @@ module "security_group" {
   ]
 }
 
+module "docrag_ecs_frontend_sg" {
+  source = "./modules/vpc/security_groups"
+  vpc_id = module.docrag_vpc.vpc_id
+  name   = "docrag_ecs_frontend_sg"
+  ingress = [
+    {
+      from_port       = 3000
+      to_port         = 3000
+      protocol        = "tcp"
+      self            = "false"
+      cidr_blocks     = []
+      security_groups = [module.docrag_frontend_lb_sg.id]
+      description     = "any"
+    }
+  ]
+  egress = [
+    {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
+}
+
+module "docrag_ecs_backend_sg" {
+  source = "./modules/vpc/security_groups"
+  vpc_id = module.docrag_vpc.vpc_id
+  name   = "docrag_ecs_backend_sg"
+  ingress = [
+    {
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      self            = "false"
+      cidr_blocks     = []
+      security_groups = [module.docrag_backend_lb_sg.id]
+      description     = "any"
+    }
+  ]
+  egress = [
+    {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
+}
+
 # Public Subnets
-module "public_subnets" {
+module "docrag_public_subnets" {
   source = "./modules/vpc/subnets"
-  name   = "public-subnet"
+  name   = "docrag-public-subnet"
   subnets = [
     {
       subnet = "10.0.1.0/24"
@@ -234,14 +331,14 @@ module "public_subnets" {
       az     = "us-east-1c"
     }
   ]
-  vpc_id                  = module.vpc.vpc_id
+  vpc_id                  = module.docrag_vpc.vpc_id
   map_public_ip_on_launch = true
 }
 
 # Private Subnets
-module "private_subnets" {
+module "docrag_private_subnets" {
   source = "./modules/vpc/subnets"
-  name   = "private-subnet"
+  name   = "docrag-private-subnet"
   subnets = [
     {
       subnet = "10.0.6.0/24"
@@ -256,100 +353,401 @@ module "private_subnets" {
       az     = "us-east-1c"
     }
   ]
-  vpc_id                  = module.vpc.vpc_id
+  vpc_id                  = module.docrag_vpc.vpc_id
   map_public_ip_on_launch = false
 }
 
 # Public Route Table
 module "public_rt" {
   source  = "./modules/vpc/route_tables"
-  name    = "public-route-table"
-  subnets = module.public_subnets.subnets[*]
+  name    = "docrag-public-route-table"
+  subnets = module.docrag_public_subnets.subnets[*]
   routes = [
     {
       cidr_block = "0.0.0.0/0"
-      gateway_id = module.vpc.igw_id
+      gateway_id = module.docrag_vpc.igw_id
     }
   ]
-  vpc_id = module.vpc.vpc_id
+  vpc_id = module.docrag_vpc.vpc_id
 }
 
 # Private Route Table
 module "private_rt" {
   source  = "./modules/vpc/route_tables"
-  name    = "private-route-table"
-  subnets = module.private_subnets.subnets[*]
+  name    = "docrag-private-route-table"
+  subnets = module.docrag_private_subnets.subnets[*]
   routes  = []
-  vpc_id  = module.vpc.vpc_id
+  vpc_id  = module.docrag_vpc.vpc_id
 }
 
-# EC2 IAM Instance Profile
-data "aws_iam_policy_document" "instance_profile_assume_role" {
-  statement {
-    effect = "Allow"
+# -----------------------------------------------------------------------------------------
+# ECR Module
+# -----------------------------------------------------------------------------------------
 
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
+# 1. Frontend Repo
+module "docrag_frontend_container_registry" {
+  source               = "./modules/ecr"
+  force_delete         = true
+  scan_on_push         = false
+  image_tag_mutability = "IMMUTABLE"
+  bash_command         = "bash ${path.cwd}/../src/frontend/artifact_push.sh docrag_frontend ${var.region} http://${module.docrag_backend_lb.lb_dns_name}"
+  name                 = "docrag_frontend"
+}
+
+# 2. Backend Repo
+module "docrag_backend_container_registry" {
+  source               = "./modules/ecr"
+  force_delete         = true
+  scan_on_push         = false
+  image_tag_mutability = "IMMUTABLE"
+  bash_command         = "bash ${path.cwd}/../src/backend/artifact_push.sh docrag_backend ${var.region}"
+  name                 = "docrag_backend"
+}
+
+# -----------------------------------------------------------------------------------------
+# Load Balancer Configuration
+# -----------------------------------------------------------------------------------------
+
+# Frontend Load Balancer
+module "docrag_frontend_lb" {
+  source                     = "./modules/load-balancer"
+  lb_name                    = "docrag-frontend-lb"
+  lb_is_internal             = false
+  lb_ip_address_type         = "ipv4"
+  load_balancer_type         = "application"
+  drop_invalid_header_fields = true
+  enable_deletion_protection = true
+  security_groups            = [module.docrag_frontend_lb_sg.id]
+  subnets                    = module.docrag_public_subnets.subnets[*].id
+  target_groups = [
+    {
+      target_group_name      = "docrag-frontend-tg"
+      target_port            = 3000
+      target_ip_address_type = "ipv4"
+      target_protocol        = "HTTP"
+      target_type            = "ip"
+      target_vpc_id          = module.docrag_vpc.vpc_id
+
+      health_check_interval            = 30
+      health_check_path                = "/auth/signin"
+      health_check_enabled             = true
+      health_check_protocol            = "HTTP"
+      health_check_timeout             = 5
+      health_check_healthy_threshold   = 3
+      health_check_unhealthy_threshold = 3
+      health_check_port                = 3000
+
     }
+  ]
+  listeners = [
+    {
+      listener_port     = 80
+      listener_protocol = "HTTP"
+      certificate_arn   = null
+      default_actions = [
+        {
+          type             = "forward"
+          target_group_arn = module.docrag_frontend_lb.target_groups[0].arn
+        }
+      ]
+    }
+  ]
+}
 
-    actions = ["sts:AssumeRole"]
+# Backend Load Balancer
+module "docrag_backend_lb" {
+  source                     = "./modules/load-balancer"
+  lb_name                    = "docrag-backend-lb"
+  lb_is_internal             = false
+  lb_ip_address_type         = "ipv4"
+  load_balancer_type         = "application"
+  enable_deletion_protection = true
+  drop_invalid_header_fields = true
+  security_groups            = [module.docrag_backend_lb_sg.id]
+  subnets                    = module.docrag_public_subnets.subnets[*].id
+  target_groups = [
+    {
+      target_group_name      = "docrag-backend-tg"
+      target_port            = 80
+      target_ip_address_type = "ipv4"
+      target_protocol        = "HTTP"
+      target_type            = "ip"
+      target_vpc_id          = module.docrag_vpc.vpc_id
+
+      health_check_interval            = 30
+      health_check_path                = "/"
+      health_check_enabled             = true
+      health_check_protocol            = "HTTP"
+      health_check_timeout             = 5
+      health_check_healthy_threshold   = 3
+      health_check_unhealthy_threshold = 3
+      health_check_port                = 80
+    }
+  ]
+  listeners = [
+    {
+      listener_port     = 80
+      listener_protocol = "HTTP"
+      certificate_arn   = null
+      default_actions = [
+        {
+          type             = "forward"
+          target_group_arn = module.docrag_backend_lb.target_groups[0].arn
+        }
+      ]
+    }
+  ]
+}
+
+# -----------------------------------------------------------------------------------------
+# ECS Configuration
+# -----------------------------------------------------------------------------------------
+resource "aws_ecs_cluster" "docrag_cluster" {
+  name = "docrag-cluster"
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
   }
 }
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["amazon"]
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
+# Cloudwatch log groups for ecs service logs
+module "docrag_frontend_ecs_log_group" {
+  source            = "./modules/cloudwatch/cloudwatch-log-group"
+  log_group_name    = "/ecs/docrag_frontend"
+  retention_in_days = 30
 }
 
-resource "aws_iam_role" "instance_profile_iam_role" {
-  name               = "instance-profile-role"
-  path               = "/"
-  assume_role_policy = data.aws_iam_policy_document.instance_profile_assume_role.json
+module "docrag_backend_ecs_log_group" {
+  source            = "./modules/cloudwatch/cloudwatch-log-group"
+  log_group_name    = "/ecs/docrag_backend"
+  retention_in_days = 30
 }
 
-data "aws_iam_policy_document" "instance_profile_policy_document" {
+data "aws_iam_policy_document" "s3_put_object_policy_document" {
   statement {
     effect    = "Allow"
-    actions   = ["s3:*"]
-    resources = ["${module.source_bucket.arn}/*"]
-  }
-  statement {
-    effect    = "Allow"
-    actions   = ["cloudwatch:*"]
+    actions   = ["s3:PutObject"]
     resources = ["*"]
   }
 }
 
-resource "aws_iam_role_policy" "instance_profile_s3_policy" {
-  role   = aws_iam_role.instance_profile_iam_role.name
-  policy = data.aws_iam_policy_document.instance_profile_policy_document.json
+resource "aws_iam_policy" "s3_put_policy" {
+  name        = "s3_put_policy"
+  description = "Policy for allowing PutObject action"
+  policy      = data.aws_iam_policy_document.s3_put_object_policy_document.json
 }
 
-resource "aws_iam_instance_profile" "iam_instance_profile" {
-  name = "iam-instance-profile"
-  role = aws_iam_role.instance_profile_iam_role.name
+# ECR-ECS IAM Role
+resource "aws_iam_role" "docrag_ecs_task_execution_role" {
+  name               = "docrag-ecs-task-execution-role"
+  assume_role_policy = <<EOF
+    {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+        "Effect": "Allow",
+        "Principal": {
+            "Service": "ecs-tasks.amazonaws.com"
+        },
+        "Action": "sts:AssumeRole"
+        }
+    ]
+    }
+    EOF
 }
 
-# EC2 Instance
-module "frontend_instance" {
-  source                      = "./modules/ec2"
-  name                        = "frontend-instance"
-  ami_id                      = data.aws_ami.ubuntu.id
-  instance_type               = "t2.micro"
-  key_name                    = "madmaxkeypair"
-  associate_public_ip_address = true
-  user_data                   = filebase64("${path.module}/scripts/user_data.sh")
-  instance_profile            = aws_iam_instance_profile.iam_instance_profile.name
-  subnet_id                   = module.public_subnets.subnets[0].id
-  security_groups             = [module.security_group.id]
+# ECR-ECS policy attachment 
+resource "aws_iam_role_policy_attachment" "docrag_ecs_task_execution_role_policy_attachment" {
+  role       = aws_iam_role.docrag_ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# X-Ray tracing
+resource "aws_iam_role_policy_attachment" "docrag_ecs_task_xray" {
+  role       = aws_iam_role.docrag_ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "s3_put_object_role_policy_attachment" {
+  role       = aws_iam_role.docrag_ecs_task_execution_role.name
+  policy_arn = aws_iam_policy.s3_put_policy.arn
+}
+
+# Frontend ECS Configuration
+module "docrag_frontend_ecs" {
+  source                                   = "./modules/ecs"
+  task_definition_family                   = "docrag_frontend_task_definition"
+  task_definition_requires_compatibilities = ["FARGATE"]
+  task_definition_cpu                      = 2048
+  task_definition_memory                   = 4096
+  task_definition_execution_role_arn       = aws_iam_role.docrag_ecs_task_execution_role.arn
+  task_definition_task_role_arn            = aws_iam_role.docrag_ecs_task_execution_role.arn
+  task_definition_network_mode             = "awsvpc"
+  task_definition_cpu_architecture         = "X86_64"
+  task_definition_operating_system_family  = "LINUX"
+  task_definition_container_definitions = jsonencode(
+    [
+      {
+        "name" : "docrag_frontend",
+        "image" : "${module.docrag_frontend_container_registry.repository_url}:latest",
+        "cpu" : 1024,
+        "memory" : 2048,
+        "essential" : true,
+        "healthCheck" : {
+          "command" : ["CMD-SHELL", "curl -f http://localhost:3000/ || exit 1"],
+          "interval" : 30,
+          "timeout" : 5,
+          "retries" : 3,
+          "startPeriod" : 60
+        },
+        "ulimits" : [
+          {
+            "name" : "nofile",
+            "softLimit" : 65536,
+            "hardLimit" : 65536
+          }
+        ]
+        "portMappings" : [
+          {
+            "containerPort" : 3000,
+            "hostPort" : 3000,
+            "name" : "docrag_frontend"
+          }
+        ],
+        "logConfiguration" : {
+          "logDriver" : "awslogs",
+          "options" : {
+            "awslogs-group" : "${module.docrag_frontend_ecs_log_group.name}",
+            "awslogs-region" : "${var.region}",
+            "awslogs-stream-prefix" : "ecs"
+          }
+        },
+        environment = [
+          {
+            name  = "BASE_URL"
+            value = "${module.docrag_backend_lb.lb_dns_name}"
+          }
+        ]
+      },
+      {
+        "name" : "xray-daemon",
+        "image" : "amazon/aws-xray-daemon",
+        "cpu" : 32,
+        "memoryReservation" : 256,
+        "portMappings" : [
+          {
+            "containerPort" : 2000,
+            "protocol" : "udp"
+          }
+        ]
+      },
+  ])
+
+  service_name                = "docrag_frontend_ecs_service"
+  service_cluster             = aws_ecs_cluster.docrag_cluster.id
+  service_launch_type         = "FARGATE"
+  service_scheduling_strategy = "REPLICA"
+  service_desired_count       = 1
+
+  deployment_controller_type = "ECS"
+  load_balancer_config = [{
+    container_name   = "docrag_frontend"
+    container_port   = 3000
+    target_group_arn = module.docrag_frontend_lb.target_groups[0].arn
+  }]
+
+  security_groups = [module.docrag_ecs_frontend_sg.id]
+  subnets = [
+    module.docrag_private_subnets.subnets[0].id,
+    module.docrag_private_subnets.subnets[1].id,
+    module.docrag_private_subnets.subnets[2].id
+  ]
+  assign_public_ip = false
+}
+
+# Backend ECS Configuration
+module "docrag_backend_ecs" {
+  source                                   = "./modules/ecs"
+  task_definition_family                   = "docrag_backend_task_definition"
+  task_definition_requires_compatibilities = ["FARGATE"]
+  task_definition_cpu                      = 2048
+  task_definition_memory                   = 4096
+  task_definition_execution_role_arn       = aws_iam_role.docrag_ecs_task_execution_role.arn
+  task_definition_task_role_arn            = aws_iam_role.docrag_ecs_task_execution_role.arn
+  task_definition_network_mode             = "awsvpc"
+  task_definition_cpu_architecture         = "X86_64"
+  task_definition_operating_system_family  = "LINUX"
+  task_definition_container_definitions = jsonencode(
+    [
+      {
+        "name" : "docrag_backend",
+        "image" : "${module.docrag_backend_container_registry.repository_url}:latest",
+        "cpu" : 1024,
+        "memory" : 2048,
+        "essential" : true,
+        "healthCheck" : {
+          "command" : ["CMD-SHELL", "curl -f http://localhost:80 || exit 1"],
+          "interval" : 30,
+          "timeout" : 5,
+          "retries" : 3,
+          "startPeriod" : 60
+        },
+        "ulimits" : [
+          {
+            "name" : "nofile",
+            "softLimit" : 65536,
+            "hardLimit" : 65536
+          }
+        ]
+        "portMappings" : [
+          {
+            "containerPort" : 80,
+            "hostPort" : 80,
+            "name" : "docrag_backend"
+          }
+        ],
+        "logConfiguration" : {
+          "logDriver" : "awslogs",
+          "options" : {
+            "awslogs-group" : "${module.docrag_backend_ecs_log_group.name}",
+            "awslogs-region" : "${var.region}",
+            "awslogs-stream-prefix" : "ecs"
+          }
+        },
+        environment = []
+      },
+      {
+        "name" : "xray-daemon",
+        "image" : "amazon/aws-xray-daemon",
+        "cpu" : 32,
+        "memoryReservation" : 256,
+        "portMappings" : [
+          {
+            "containerPort" : 2000,
+            "protocol" : "udp"
+          }
+        ]
+      }
+  ])
+
+  service_name                = "docrag_backend_ecs_service"
+  service_cluster             = aws_ecs_cluster.docrag_cluster.id
+  service_launch_type         = "FARGATE"
+  service_scheduling_strategy = "REPLICA"
+  service_desired_count       = 1
+
+  deployment_controller_type = "ECS"
+  load_balancer_config = [{
+    container_name   = "docrag_backend"
+    container_port   = 80
+    target_group_arn = module.docrag_backend_lb.target_groups[0].arn
+  }]
+
+  security_groups = [module.docrag_ecs_backend_sg.id]
+  subnets = [
+    module.docrag_private_subnets.subnets[0].id,
+    module.docrag_private_subnets.subnets[1].id,
+    module.docrag_private_subnets.subnets[2].id
+  ]
+  assign_public_ip = false
 }
