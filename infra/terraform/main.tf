@@ -123,9 +123,9 @@ module "lambda_function" {
   function_name = "lambda-function"
   role_arn      = module.lambda_function_iam_role.arn
   env_variables = {
-    REGION            = var.region
-    PINECONE_API_KEY = ""
-    PINECONE_ENV = ""
+    REGION              = var.region
+    PINECONE_API_KEY    = ""
+    PINECONE_ENV        = ""
     PINECONE_INDEX_NAME = ""
   }
   handler    = "lambda_function.lambda_handler"
@@ -294,6 +294,20 @@ data "aws_iam_policy_document" "instance_profile_assume_role" {
     }
 
     actions = ["sts:AssumeRole"]
+  }
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
   }
 }
 
