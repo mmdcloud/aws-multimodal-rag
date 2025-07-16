@@ -50,7 +50,7 @@ module "sqs" {
         Resource  = "arn:aws:sqs:${var.region}:*:document-upload-queue"
         Condition = {
           ArnEquals = {
-            "aws:SourceArn" = module.mediaconvert_source_bucket.arn
+            "aws:SourceArn" = module.source_bucket.arn
           }
         }
       }
@@ -61,7 +61,7 @@ module "sqs" {
 #  Lambda SQS event source mapping
 resource "aws_lambda_event_source_mapping" "sqs_event_trigger" {
   event_source_arn                   = module.sqs.arn
-  function_name                      = module.mediaconvert_lambda_function.arn
+  function_name                      = module.lambda_function.arn
   enabled                            = true
   batch_size                         = 10
   maximum_batching_window_in_seconds = 60
@@ -97,24 +97,36 @@ module "lambda_function_iam_role" {
             "Action": [
                 "logs:CreateLogGroup",
                 "logs:CreateLogStream",
-                "logs:PutLogEvents",
-                "mediaconvert:*"
+                "logs:PutLogEvents"
             ],
             "Resource": "arn:aws:logs:*:*:*",
             "Effect": "Allow"
+        },
+        {
+            "Action": [
+                "s3:*",            
+            ],
+            "Effect"   : "Allow",
+            "Resource" : [
+                "${module.source_bucket.arn}"
+                "${module.source_bucket.arn}/*"
+            ]
         }      
       ]
     }
     EOF
 }
 
-# Lambda function to process media files
+# Lambda function to upload document embeddings into vector database
 module "lambda_function" {
   source        = "./modules/lambda"
   function_name = "lambda-function"
   role_arn      = module.lambda_function_iam_role.arn
   env_variables = {
     REGION            = var.region
+    PINECONE_API_KEY = ""
+    PINECONE_ENV = ""
+    PINECONE_INDEX_NAME = ""
   }
   handler    = "lambda_function.lambda_handler"
   runtime    = "python3.12"
@@ -123,9 +135,10 @@ module "lambda_function" {
   depends_on = [module.mediaconvert_function_code_bucket]
 }
 
+# Cognito
 module "cognito" {
   source                     = "./modules/cognito"
-  name                       = "mediaconvert-users"
+  name                       = "docrag-users"
   username_attributes        = ["email"]
   auto_verified_attributes   = ["email"]
   password_minimum_length    = 8
@@ -141,11 +154,11 @@ module "cognito" {
     }
   ]
   verification_message_template_default_email_option = "CONFIRM_WITH_CODE"
-  verification_email_subject                         = "Verify your email for MediaConvert"
+  verification_email_subject                         = "Verify your email for DocRag"
   verification_email_message                         = "Your verification code is {####}"
   user_pool_clients = [
     {
-      name                                 = "mediaconvert_client"
+      name                                 = "docrag_client"
       generate_secret                      = false
       explicit_auth_flows                  = ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
       allowed_oauth_flows_user_pool_client = true
@@ -156,4 +169,173 @@ module "cognito" {
       supported_identity_providers         = ["COGNITO"]
     }
   ]
+}
+
+# VPC Configuration
+module "vpc" {
+  source                = "./modules/vpc/vpc"
+  vpc_name              = "vpc"
+  vpc_cidr_block        = "10.0.0.0/16"
+  enable_dns_hostnames  = true
+  enable_dns_support    = true
+  internet_gateway_name = "vpc_igw"
+}
+
+# Security Group
+module "security_group" {
+  source = "./modules/vpc/security_groups"
+  vpc_id = module.vpc.vpc_id
+  name   = "security-group"
+  ingress = [
+    {
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      self            = "false"
+      cidr_blocks     = ["0.0.0.0/0"]
+      security_groups = []
+      description     = "any"
+    },
+    {
+      from_port       = 22
+      to_port         = 22
+      protocol        = "tcp"
+      self            = "false"
+      cidr_blocks     = ["0.0.0.0/0"]
+      security_groups = []
+      description     = "any"
+    }
+  ]
+  egress = [
+    {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
+}
+
+# Public Subnets
+module "public_subnets" {
+  source = "./modules/vpc/subnets"
+  name   = "public-subnet"
+  subnets = [
+    {
+      subnet = "10.0.1.0/24"
+      az     = "us-east-1a"
+    },
+    {
+      subnet = "10.0.2.0/24"
+      az     = "us-east-1b"
+    },
+    {
+      subnet = "10.0.3.0/24"
+      az     = "us-east-1c"
+    }
+  ]
+  vpc_id                  = module.vpc.vpc_id
+  map_public_ip_on_launch = true
+}
+
+# Private Subnets
+module "private_subnets" {
+  source = "./modules/vpc/subnets"
+  name   = "private-subnet"
+  subnets = [
+    {
+      subnet = "10.0.6.0/24"
+      az     = "us-east-1a"
+    },
+    {
+      subnet = "10.0.5.0/24"
+      az     = "us-east-1b"
+    },
+    {
+      subnet = "10.0.4.0/24"
+      az     = "us-east-1c"
+    }
+  ]
+  vpc_id                  = module.vpc.vpc_id
+  map_public_ip_on_launch = false
+}
+
+# Public Route Table
+module "public_rt" {
+  source  = "./modules/vpc/route_tables"
+  name    = "public-route-table"
+  subnets = module.public_subnets.subnets[*]
+  routes = [
+    {
+      cidr_block = "0.0.0.0/0"
+      gateway_id = module.vpc.igw_id
+    }
+  ]
+  vpc_id = module.vpc.vpc_id
+}
+
+# Private Route Table
+module "private_rt" {
+  source  = "./modules/vpc/route_tables"
+  name    = "private-route-table"
+  subnets = module.private_subnets.subnets[*]
+  routes  = []
+  vpc_id  = module.vpc.vpc_id
+}
+
+# EC2 IAM Instance Profile
+data "aws_iam_policy_document" "instance_profile_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "instance_profile_iam_role" {
+  name               = "instance-profile-role"
+  path               = "/"
+  assume_role_policy = data.aws_iam_policy_document.instance_profile_assume_role.json
+}
+
+data "aws_iam_policy_document" "instance_profile_policy_document" {
+  statement {
+    effect    = "Allow"
+    actions   = ["s3:*"]
+    resources = ["${module.source_bucket.arn}/*"]
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["cloudwatch:*"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "instance_profile_s3_policy" {
+  role   = aws_iam_role.instance_profile_iam_role.name
+  policy = data.aws_iam_policy_document.instance_profile_policy_document.json
+}
+
+resource "aws_iam_instance_profile" "iam_instance_profile" {
+  name = "iam-instance-profile"
+  role = aws_iam_role.instance_profile_iam_role.name
+}
+
+# EC2 Instance
+module "frontend_instance" {
+  source                      = "./modules/ec2"
+  name                        = "frontend-instance"
+  ami_id                      = data.aws_ami.ubuntu.id
+  instance_type               = "t2.micro"
+  key_name                    = "madmaxkeypair"
+  associate_public_ip_address = true
+  user_data                   = filebase64("${path.module}/scripts/user_data.sh")
+  instance_profile            = aws_iam_instance_profile.iam_instance_profile.name
+  subnet_id                   = module.public_subnets.subnets[0].id
+  security_groups             = [module.security_group.id]
 }
